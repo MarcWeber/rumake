@@ -1,4 +1,7 @@
-# encoding: UTF-8# encoding: UTF-8
+# encoding: UTF-8
+
+# github.com/MarcWeber/rumake
+
 require "set"
 require "thread"
 
@@ -36,6 +39,10 @@ module Rumake
   # the controller starting tasks, knowing about which tasks exist etc
   class TaskContainer
 
+    def self.instance
+      @@default_instance ||= TaskContainer.new
+    end
+
     def initialize()
       # used for resolving names
       @tasks_by_name = Hash.new
@@ -55,6 +62,7 @@ module Rumake
 
     def addtask(task)
       raise "bad task #{task.inspect}" unless task.is_a? Task
+      raise "duplicate task #{task.name}" if @tasks_by_name.include? task.name
       task.aliases.each {|v| @tasks_by_name[v] = task}
       @tasks << task
     end
@@ -68,15 +76,30 @@ module Rumake
     end
 
     def createTaskByName(name)
-      raise name.inspect
-      FilePrerequisite.new({:container => self, :files => [name]})
+      FileTask.new({:container => self, :files => [name]}) do
+      end
     end
 
-    def realise(cachefile, slots, keep_going, *targets)
+    def initGuard
+      raise "call .init first" unless @slots
+    end
+
+    def init(cachefile, slots)
+      @cachefile = cachefile
       @cache = (File.exists? cachefile) ? File.open(cachefile, "rb") { |file| Marshal.load(file) } : {}
       @slots = slots
-      @keep_going = keep_going
+    end
 
+    def list(targets = nil)
+      initGuard
+      targets = @tasks_by_name.keys unless targets
+      prepare(targets)
+      @tasks.each {|v|
+        puts "task #{v.inspect} : weight: #{v.weight}"
+      }
+    end
+
+    def prepare(targets)
       @uptodate_tasks  = Set.new # prerequisites not met yet, wait for them
       @waiting_tasks  = TaskList.new # prerequisites not met yet, wait for them
       @runnable_tasks = TaskList.new # can be started
@@ -85,6 +108,7 @@ module Rumake
 
       @submitResult = Queue.new
       seen = Set.new
+      puts "preparing #{targets.inspect}"
       @targets = targets.map {|v| resolveTask(v)}
 
       @targets.each {|v| v.prepare(0, [], seen) }
@@ -92,6 +116,13 @@ module Rumake
         puts "nothing to do"
         return
       end
+    end
+
+    def realise(keep_going, *targets)
+      initGuard
+      @keep_going = keep_going
+
+      prepare(targets)
 
       startTasks
       while @running_tasks.length > 0
@@ -105,7 +136,7 @@ module Rumake
         when :success
           task.depending_tasks.each {|v| v.notify_dependency_realised(task) }
           startTasks
-          puts "#{@running_tasks.length + @runnable_tasks.length + @waiting_tasks.length} tasks left, #{@running_tasks.length} running"
+          puts "#{@running_tasks.length + @runnable_tasks.length + @waiting_tasks.length} tasks left, #{@running_tasks.length}"
         when :failure
           exception = r[:exception]
           if exception.to_s != "STOP IT"
@@ -132,7 +163,7 @@ module Rumake
         end
       end
 
-      File.open(cachefile, "wb") { |file| Marshal.dump(@cache, file) }
+      File.open(@cachefile, "wb") { |file| Marshal.dump(@cache, file) }
     end
 
     # from this task visit all tasks depending on this recursively
@@ -183,9 +214,6 @@ module Rumake
 
   end
 
-  attr_reader :task_container
-  @task_container = TaskContainer.new
-
   class TaskCache
     def initialize(container, task)
       @container = container
@@ -204,30 +232,33 @@ module Rumake
     # :prereqs: on which other tasks does this task depend. Either names or task objects
     # :aliases This task provides aliases (names, file names, whatever)
 
-    attr_reader :prereqs, :aliases, :needsRun, :weight, :depending_tasks
+    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks
 
     def initialize(opts, &blk)
       @blk = blk
 
       @prereqs = Set.new
       @aliases = opts.fetch(:aliases, [])
-      @aliases = [@aliases] if @aliases.instance_of? String
+      @aliases = [@aliases] if @aliases.is_a? String or @aliases.is_a? Symbol
       @aliases.sort!
       add_prereqs(*opts.fetch(:prereqs, []))
 
-      @container = opts.fetch(:container, Rumake::task_container)
+      @container = opts.fetch(:container, Rumake::TaskContainer.instance)
       @container.addtask(self)
-      @needsRun = nil
       @depending_tasks = Set.new
       @cache = TaskCache.new(@container, self)
 
       @own_thread = opts.fetch(:own_thread, false)
+
+      # phony true: always run task
+      @phony = opts.fetch(:phony, false)
+      @prepared = false
     end
 
     def name; @aliases[0]; end
 
     def inspect
-      "<Task aliases: #{@aliases.inspect}>"
+      "<Task aliases: #{@aliases.inspect} #{@needsRun ? "needs run" : ""} :depends #{@prereqs.map {|v| v.name}}>"
     end
 
     def add_prereqs(*v)
@@ -248,6 +279,9 @@ module Rumake
 
       # replace names by tasks
       @prereqs.map! {|v| @container.resolveTask(v) }
+      @prereqs.each {|p|
+        raise "bad prereq #{p} of #{name}" unless p.is_a? Task
+      }
 
       @weight = weight + estimated_time
 
@@ -257,9 +291,15 @@ module Rumake
       }
 
       @neededPrereqs = @prereqs.select {|v| v.needsRun }
-      determineNeedsRun
+      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun }) \
+        ? {:needsRun => true} \
+        : determineState
+      if not @state.include? :needsRun
+        p_stamp = @prereqs.map {|p| p.timestamp }.compact.max
+        @state = {:needsRun => p_stamp.nil? ? false : p_stamp > @state[:timestamp]}
+      end
 
-      if @needsRun
+      if needsRun
         if @neededPrereqs.count == 0
           @container.runnable(self) 
         else
@@ -272,6 +312,11 @@ module Rumake
       @status = :prepared
       @thread = nil
       @started = nil
+      @prepared = true
+    end
+
+    def needsRun
+      @state[:needsRun]
     end
 
     def start(submitResult)
@@ -320,18 +365,28 @@ module Rumake
     end
 
     def run_blk
-      @blk.call
+      @blk.call if @blk
     end
 
     # some tasks may be interrupted, others should finish
     # TODO add an option
     def cancel()
       @status = :canceled
-      @thread.raise "STOP IT"
+      @thread.raise "STOP IT" if @thread
     end
 
-    def determineNeedsRun
-      @needsRun = @neededPrereqs.count > 0
+    def timestamp
+      @state[:timestamp]
+    end
+
+    def needsRun
+      @state[:needsRun]
+    end
+
+    # must return either :needsRun or :timestamp
+    # its only called if no of the @prereqs needs to be run
+    def determineState
+      return {:needsRun => @phony}
     end
 
     def estimated_time
@@ -341,13 +396,13 @@ module Rumake
   end
 
 
-  # dummy task, reperesents a file to depend on
   # The timestamp is stored in the cache.
   # If that changes or the file does not exist this file must be "rebuild"
   # rebuilding can be a command, otherwise the timestamp is stored only
-  class FilePrerequisite < Task
+  class FileTask < Task
 
     def initialize(opts, &blk)
+      raise "blk is nil" if blk.nil?
       raise "key :files expected in opts" unless opts.include? :files
       opts[:files] = [opts[:files]] if opts[:files].is_a? String
       opts[:aliases] ||= opts.fetch(:files)
@@ -359,34 +414,44 @@ module Rumake
       @exists = Hash.new
     end
 
-    def notify_result(r)
-      Task.instance_method(:notify_result).bind(self).call(r)
-      case r[:result]
-      when :success
-        @files.each {|file|
-          @exists[file] = true
-          @stamps[file] = File.mtime(file)
-          @cache.store(file, @stamps[file])
-        }
-      end
+    def determineState
+      return {:needsRun => true } if @files.any? {|file| not File.exists? file }
+      return {:timestamp => @files.each {|file| File.mtime(file) }.max }
+    end
+
+    def run_blk
+      # @files.each {|v| File.delete(v) if File.exists? v}
+      Task.instance_method(:run_blk).bind(self).call
+      # ensure files exist now
+      @files.each {|v| raise "task failed to create target file #{v}. This usually means there is no rule to build this file." unless File.exists? v }
+    end
+
+  end
+
+  # be happy if the directory exists
+  class DirTask < Task
+
+    def initialize(opts, &blk)
+      raise "blk is nil" if blk.nil?
+      raise "key :dirs expected in opts" unless opts.include? :dirs
+      opts[:dirs] = [opts[:dirs]] if opts[:dirs].is_a? String
+      opts[:aliases] ||= opts.fetch(:dirs)
+      @dirs = opts[:dirs]
+
+      @dirs.each {|v| raise "bad file #{v}" unless v.is_a? String }
+      super(opts, &blk)
+      @exists = Hash.new
     end
 
     def run_blk
       @files.each {|v| File.delete(v) if File.exists? v}
       Task.instance_method(:run_blk).bind(self).call
       # ensure files exist now
-      @files.each {|v| raise "task failed to create target file #{v}" unless File.exists? v }
+      @dirs.each {|dir| raise "task failed to create target directory #{dir}" unless Dir.exists? v }
     end
 
-    def determineNeedsRun
-      # which is the ruby way to do this?
-      @needsRun = Task.instance_method(:determineNeedsRun).bind(self).call
-
-      @files.each {|file|
-        @exists[file] ||= File.exist? file
-        @stamps[file] ||= File.mtime(file) if @exists[file]
-        @needsRun ||= @stamps[file].nil? || @cache.retrieve(file) != @stamps[file]
-      }
+    def determineState
+      return {:needsRun => @dirs.any? {|dir| not Dir.exist? dir } }
     end
 
   end
@@ -398,7 +463,7 @@ module Rumake
   end
 
   # poor man rake like DSL (TODO move into its own module?)
-  # everything is multitask
+  # everything is multitask always
   def task(opts, &blk)
     o = {}
     case opts
@@ -409,6 +474,7 @@ module Rumake
       o[:prereqs] = opts.values[0]
     end
     o[:own_thread] = false
+    o[:phony] = true
     Task.new(o, &blk)
   end
 
@@ -423,6 +489,22 @@ module Rumake
       o[:prereqs] = opts.values[0]
     end
     o[:own_thread] = true
-    FilePrerequisite.new(o, &blk)
+    FileTask.new(o, &blk)
   end
+
+
+  def dir(opts, &blk)
+    o = {}
+    case opts
+    when String
+      o[:dirs] = [opts]
+    when Hash
+      raise "one key value expected" unless opts.length == 1
+      o[:dirs] = opts.keys[0]
+      o[:prereqs] = opts.values[0]
+    end
+    o[:own_thread] = true
+    DirTask.new(o, &blk)
+  end
+
 end
