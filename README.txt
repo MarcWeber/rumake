@@ -13,6 +13,9 @@ features:
 
 TODO:
 - rake like DSL
+- show estimate build time by simulating the build before building it
+  Of course this will only be valid if you build the second time
+
 
 goals:
 write the code in a way so that it can eventually be used by guard one day
