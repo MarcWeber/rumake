@@ -9,12 +9,11 @@ features:
 * tries to build the dependency path which is supposed to take longest first
 * no processes, based but multiple threads (which is fine if you run compilers
   anyway)
+* estimated time of arrival support by simulating the build
 
 
 TODO:
 - rake like DSL
-- show estimate build time by simulating the build before building it
-  Of course this will only be valid if you build the second time
 
 
 goals:

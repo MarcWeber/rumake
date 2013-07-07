@@ -43,8 +43,16 @@ end
 
 # yes, a DSL is still missing
 Rumake::TaskContainer.instance.init("rumake.cache", 4)
-if ARGV[0] == "list"
+case ARGV[0]
+when "list"
   Rumake::TaskContainer.instance.list
+when "eta"
+  eta = Rumake::TaskContainer.instance.eta(*ARGV.drop(1))
+  puts "#{eta} secs"
 else
-  Rumake::TaskContainer.instance.realise(false, *ARGV)
+  Rumake::TaskContainer.instance.realise(
+    :targets => ARGV,
+    :show_eta => true,
+    :keep_going => false
+  )
 end

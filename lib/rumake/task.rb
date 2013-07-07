@@ -34,6 +34,78 @@ module Rumake
     def length; @byObj.length; end
     def to_a; @byObj.to_a; end
     def include?(x); @byObj.include? x; end
+    def each(&blk); @byObj.each(&blk); end
+    def map(&blk); @byObj.map(&blk); end
+    def sort(&blk); @byObj.sort(&blk); end
+
+    class << self
+      def [](*x)
+        t = TaskList.new
+        x.each {|v| t << v}
+        t
+      end
+    end
+  end
+
+  # used for ETA only, does nothing
+  class ETATask
+    attr_reader :id, :needsRun, :weight, :name, :neededPrereqs
+    attr_accessor :eta
+    def initialize(id, needsRun, neededPrereqs, weight, eta, name)
+      @id = id
+      @needsRun = needsRun
+      @neededPrereqs = neededPrereqs
+      @weight = weight
+      @eta = eta
+      @name = name
+    end
+
+    def startTasks(submitResult)
+    end
+
+    def start(blk); end
+
+    class << self
+      def fromTask(task)
+        raise "bad eta #{task.name}" if task.eta.nil?
+        new(task.object_id, task.needsRun, task.neededPrereqs.map {|task|
+          raise "bad" unless task.is_a? Task
+          task.object_id
+        }, task.weight, task.eta, task.name)
+      end
+    end
+  end
+
+  class BuildState
+    attr_accessor :uptodate_tasks, :waiting_tasks, :runnable_tasks, :running_tasks, :failed_tasks, :slots
+
+    def initialize(slots, verbose = true)
+      @slots = slots
+      @verbose = verbose
+
+      @uptodate_tasks  = Set.new # prerequisites not met yet, wait for them
+      @waiting_tasks  = TaskList.new # prerequisites not met yet, wait for them
+      @runnable_tasks = TaskList.new # can be started
+      @running_tasks  = TaskList.new # these are running
+      @failed_tasks = TaskList.new
+    end
+
+
+    # returns amount of started tasks
+    def startTasks(&submitResult)
+      # TODO test sort, use something else, sorting array might be slow ?
+      to_start = @runnable_tasks.take_sorted(@slots)
+      return 0 if to_start.empty?
+      puts "starting #{to_start.map {|v| v.name}}" if @verbose
+      to_start.each {|task|
+        @runnable_tasks.delete task
+        @running_tasks << task
+        task.start submitResult
+        @slots -= 1
+      }
+      return to_start.length
+    end
+
   end
 
   # the controller starting tasks, knowing about which tasks exist etc
@@ -53,11 +125,11 @@ module Rumake
       @cache = Hash.new
     end
 
-    def uptodate(task); @uptodate_tasks << task; end
-    def waiting(task); @waiting_tasks << task; end
+    def uptodate(task); @bs.uptodate_tasks << task; end
+    def waiting(task); @bs.waiting_tasks << task; end
     def runnable(task);
-      @waiting_tasks.delete task if @waiting_tasks.include? task
-      @runnable_tasks << task;
+      @bs.waiting_tasks.delete task if @bs.waiting_tasks.include? task
+      @bs.runnable_tasks << task;
     end
 
     def addtask(task)
@@ -100,11 +172,7 @@ module Rumake
     end
 
     def prepare(targets)
-      @uptodate_tasks  = Set.new # prerequisites not met yet, wait for them
-      @waiting_tasks  = TaskList.new # prerequisites not met yet, wait for them
-      @runnable_tasks = TaskList.new # can be started
-      @running_tasks  = TaskList.new # these are running
-      @failed_tasks = TaskList.new
+      @bs = BuildState.new(@slots)
 
       @submitResult = Queue.new
       seen = Set.new
@@ -112,31 +180,102 @@ module Rumake
       @targets = targets.map {|v| resolveTask(v)}
 
       @targets.each {|v| v.prepare(0, [], seen) }
-      if @runnable_tasks.length == 0
+      if @bs.runnable_tasks.length == 0
         puts "nothing to do"
         return
       end
     end
 
-    def realise(keep_going, *targets)
+    # simulate build based on previous :eta timings to find out how long the build is likely to take
+    def eta(*targets)
+      initGuard
+      prepare(targets)
+      eta_prepared
+    end
+
+    def eta_prepared
+
+      bs = BuildState.new(@slots, false)
+
+      # waiting tasks -> runnable tasks if no more prereqs have to run
+
+      bs.runnable_tasks = TaskList[*@bs.runnable_tasks.map {|task| ETATask.fromTask task }]
+      bs.waiting_tasks = TaskList[*@bs.waiting_tasks.map {|task| ETATask.fromTask task }]
+
+      m = Hash.new
+      (bs.running_tasks.to_a + bs.waiting_tasks.to_a).each {|eta_t|
+        eta_t.eta = 0 unless eta_t.needsRun
+        m[eta_t.id] = eta_t
+      }
+
+      # now simulate the task
+      slots = @slots
+
+      total_time_secs = 0
+
+      while true
+
+        bs.waiting_tasks.to_a.each {|t|
+          if t.neededPrereqs.empty?
+            bs.runnable_tasks << t 
+            bs.waiting_tasks.delete t
+          end
+        }
+
+        break if bs.running_tasks.length == 0 && bs.runnable_tasks.length == 0
+
+        started = bs.startTasks {}
+        break if bs.running_tasks.length == 0
+
+        #finish fastest task
+        end_task = bs.running_tasks.sort {|k,v| k.eta - v.eta }[0]
+        bs.slots += 1
+        bs.running_tasks.delete end_task
+        total_time_secs += end_task.eta
+        bs.running_tasks.each {|t| t.eta -= end_task.eta}
+
+        m.values.each {|t| t.neededPrereqs.delete end_task.id }
+      end
+
+      if bs.waiting_tasks.length > 0
+        puts "slots: #{bs.slots}"
+        puts "something went wrong"
+        puts "waiting tasks: #{bs.waiting_tasks.length}"
+        puts "runnable tasks: #{bs.runnable_tasks.length}"
+        bs.waiting_tasks.each {|task|
+          puts "name: #{task.name}  needed prereqs: #{task.neededPrereqs.map {|id| @tasks.detect {|t| t.object_id == id }.name }.inspect}"
+        }
+        raise "unexpected"
+      end
+      total_time_secs
+    end
+
+    def realise(opts)
+      keep_going = opts.fetch(:keep_going, false)
+      targets = opts.fetch(:targets)
+      show_eta = opts.fetch(:show_eta, true)
+
       initGuard
       @keep_going = keep_going
 
       prepare(targets)
 
-      startTasks
-      while @running_tasks.length > 0
+      puts "eta: #{eta_prepared} secs" if show_eta
+
+
+      @bs.startTasks {|v| @submitResult.enq v }
+      while @bs.running_tasks.length > 0
         r = @submitResult.deq
-        @slots += 1
-        task = @running_tasks.by_object_id(r[:object_id])
+        @bs.slots += 1
+        task = @bs.running_tasks.by_object_id(r[:object_id])
         # tell task about result so that it can finish taking time etc
         task.notify_result(r)
-        @running_tasks.delete(task)
+        @bs.running_tasks.delete(task)
         case r[:result]
         when :success
           task.depending_tasks.each {|v| v.notify_dependency_realised(task) }
-          startTasks
-          puts "#{@running_tasks.length + @runnable_tasks.length + @waiting_tasks.length} tasks left, #{@running_tasks.length}"
+          @bs.startTasks {|v| @submitResult.enq v }
+          puts "#{@bs.running_tasks.length + @bs.runnable_tasks.length + @bs.waiting_tasks.length} tasks left, #{@bs.running_tasks.length}"
         when :failure
           exception = r[:exception]
           if exception.to_s != "STOP IT"
@@ -145,11 +284,11 @@ module Rumake
             puts r[:exception].backtrace 
           end
           # make all tasks fail depending on this
-          @failed_tasks << task
+          @bs.failed_tasks << task
           visit_depending_tasks(task) do |task|
-            if @waiting_tasks.include? task
-              @waiting_tasks.remove task
-              @failed_tasks << task
+            if @bs.waiting_tasks.include? task
+              @bs.waiting_tasks.remove task
+              @bs.failed_tasks << task
               true
             else
               false
@@ -157,7 +296,7 @@ module Rumake
           end
           if not @keep_going
             # try aborting all running tasks
-            @running_tasks.to_a.each {|task| task.cancel }
+            @bs.running_tasks.to_a.each {|task| task.cancel }
           end
         else; raise "unexpected"
         end
@@ -180,19 +319,6 @@ module Rumake
           todo += task.depending_tasks if yield task
         end
       end
-    end
-
-    def startTasks
-      # TODO test sort, use something else, sorting array might be slow ?
-      to_start = @runnable_tasks.take_sorted(@slots)
-      return if to_start.empty?
-      puts "starting #{to_start.map {|v| v.name}}"
-      to_start.each {|task|
-        @runnable_tasks.delete task
-        @running_tasks << task
-        task.start @submitResult
-        @slots -= 1
-      }
     end
 
     # cache implementation
@@ -232,7 +358,7 @@ module Rumake
     # :prereqs: on which other tasks does this task depend. Either names or task objects
     # :aliases This task provides aliases (names, file names, whatever)
 
-    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks
+    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks, :neededPrereqs
 
     def initialize(opts, &blk)
       @blk = blk
@@ -283,7 +409,7 @@ module Rumake
         raise "bad prereq #{p} of #{name}" unless p.is_a? Task
       }
 
-      @weight = weight + estimated_time
+      @weight = weight + eta
 
       @prereqs.each {|v|
         v.prepare(@weight, prepared + [self], seen)
@@ -337,7 +463,7 @@ module Rumake
       return if @status == :canceled
       return if r[:result] == :failure
 
-      @cache.store(:et, Time.now - @started)
+      @cache.store(:eta, Time.now - @started)
     end
 
     def notify_dependency_realised(task)
@@ -351,12 +477,12 @@ module Rumake
       begin
         run_blk
 
-        submitResult.enq({
+        submitResult.call({
           :object_id => self.object_id,
           :result => :success,
         })
       rescue Exception => e
-        submitResult.enq({
+        submitResult.call({
           :object_id => self.object_id,
           :result => :failure,
           :exception => e
@@ -389,8 +515,9 @@ module Rumake
       return {:needsRun => @phony}
     end
 
-    def estimated_time
-      @cache.retrieve(:et, 0.01)
+    def eta
+      eta = @cache.retrieve(:eta)
+      eta.nil? ? 0.01 : eta
     end
 
   end
