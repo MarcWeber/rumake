@@ -68,10 +68,13 @@ module Rumake
     class << self
       def fromTask(task)
         raise "bad eta #{task.name}" if task.eta.nil?
+        now = Time.now
         new(task.object_id, task.needsRun, task.neededPrereqs.map {|task|
           raise "bad" unless task.is_a? Task
           task.object_id
-        }, task.weight, task.eta, task.name)
+        }, task.weight,
+        task.started ? task.eta - (now - task.started) : task.eta,
+        task.name)
       end
     end
   end
@@ -194,11 +197,11 @@ module Rumake
     end
 
     def eta_prepared
-
       bs = BuildState.new(@slots, false)
 
       # waiting tasks -> runnable tasks if no more prereqs have to run
 
+      bs.running_tasks = TaskList[*@bs.running_tasks.map {|task| ETATask.fromTask task }]
       bs.runnable_tasks = TaskList[*@bs.runnable_tasks.map {|task| ETATask.fromTask task }]
       bs.waiting_tasks = TaskList[*@bs.waiting_tasks.map {|task| ETATask.fromTask task }]
 
@@ -251,17 +254,12 @@ module Rumake
     end
 
     def realise(opts)
-      keep_going = opts.fetch(:keep_going, false)
-      targets = opts.fetch(:targets)
-      show_eta = opts.fetch(:show_eta, true)
-
       initGuard
-      @keep_going = keep_going
+      prepare(opts.fetch(:targets))
 
-      prepare(targets)
+      @keep_going = opts.fetch(:keep_going, false)
 
-      puts "eta: #{eta_prepared} secs" if show_eta
-
+      eta_shown = Time.now
 
       @bs.startTasks {|v| @submitResult.enq v }
       while @bs.running_tasks.length > 0
@@ -275,7 +273,12 @@ module Rumake
         when :success
           task.depending_tasks.each {|v| v.notify_dependency_realised(task) }
           @bs.startTasks {|v| @submitResult.enq v }
-          puts "#{@bs.running_tasks.length + @bs.runnable_tasks.length + @bs.waiting_tasks.length} tasks left, #{@bs.running_tasks.length}"
+          puts "%d tasks left, %d running" % [@bs.running_tasks.length + @bs.runnable_tasks.length + @bs.waiting_tasks.length, @bs.running_tasks.length]
+
+          if opts.fetch(:show_eta, true) && Time.now - eta_shown > 2
+            eta_shown = Time.now
+            puts "==>  ETA %.3f secs" % eta_prepared 
+          end
         when :failure
           exception = r[:exception]
           if exception.to_s != "STOP IT"
@@ -358,7 +361,7 @@ module Rumake
     # :prereqs: on which other tasks does this task depend. Either names or task objects
     # :aliases This task provides aliases (names, file names, whatever)
 
-    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks, :neededPrereqs
+    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks, :neededPrereqs, :started
 
     def initialize(opts, &blk)
       @blk = blk
@@ -547,10 +550,26 @@ module Rumake
     end
 
     def run_blk
-      # @files.each {|v| File.delete(v) if File.exists? v}
-      Task.instance_method(:run_blk).bind(self).call
-      # ensure files exist now
-      @files.each {|v| raise "task failed to create target file #{v}. This usually means there is no rule to build this file." unless File.exists? v }
+      # if the build is canceled don't move target files to a .bad location
+
+      begin
+        # @files.each {|v| File.delete(v) if File.exists? v}
+        Task.instance_method(:run_blk).bind(self).call
+        # ensure files exist now
+        @files.each {|f|
+          raise "task failed to create target file #{v}. This usually means there is no rule to build this file." unless File.exists? f
+          File.delete "#{f}.rumakebad" if File.exist? "#{f}.rumakebad"
+        }
+
+      rescue Exception => e
+        @files.each {|f|
+          if File.exist? f
+            puts "#{f} -> #{f}.rumakebad"
+            File.rename f "#{f}.rumakebad"
+          end
+        }
+        raise e
+      end
     end
 
   end
