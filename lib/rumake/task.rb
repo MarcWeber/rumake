@@ -7,6 +7,22 @@ require "thread"
 
 module Rumake
 
+  module Actions
+    class ShellCommands
+      attr_reader :shell_commands
+      def initialize(*shell_commands)
+        @shell_commands = shell_commands
+      end
+
+      def call
+        @shell_commands.each do |cmd|
+          `#{cmd}`
+          raise "#{cmd} failed" unless $? == 0
+        end
+      end
+    end
+  end
+
   # simple list containing tasks
   class TaskList
     def initialize()
@@ -151,7 +167,7 @@ module Rumake
     end
 
     def createTaskByName(name)
-      FileTask.new({:container => self, :files => [name]}) do
+      Tasks::FileDummy.new({:container => self, :files => [name]}) do
       end
     end
 
@@ -364,13 +380,20 @@ module Rumake
     attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks, :neededPrereqs, :started
 
     def initialize(opts, &blk)
-      @blk = blk
+      @action = (opts.include? :shell_commands) ? Rumake::Actions::ShellCommands.new(*opts[:shell_commands]) : blk
 
-      @prereqs = Set.new
       @aliases = opts.fetch(:aliases, [])
-      @aliases = [@aliases] if @aliases.is_a? String or @aliases.is_a? Symbol
-      @aliases.sort!
-      add_prereqs(*opts.fetch(:prereqs, []))
+      @aliases = [*@aliases]
+      @prereqs = Set[*opts.fetch(:prereqs, [])]
+
+      @prereqs.each {|v|
+        case v
+        when String
+        when Symbol
+        when Task
+        else "bad prerequisite #{v}"
+        end
+      }
 
       @container = opts.fetch(:container, Rumake::TaskContainer.instance)
       @container.addtask(self)
@@ -387,11 +410,7 @@ module Rumake
     def name; @aliases[0]; end
 
     def inspect
-      "<Task aliases: #{@aliases.inspect} #{@needsRun ? "needs run" : ""} :depends #{@prereqs.map {|v| v.name}}>"
-    end
-
-    def add_prereqs(*v)
-      @prereqs += v
+      "<#{self.class.name} aliases: #{@aliases.inspect} #{@needsRun ? "needs run" : ""} :depends #{@prereqs.map {|v| v.name}}>"
     end
 
     def depending_task(task)
@@ -420,7 +439,7 @@ module Rumake
       }
 
       @neededPrereqs = @prereqs.select {|v| v.needsRun }
-      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun }) \
+      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun } || @phony) \
         ? {:needsRun => true} \
         : determineState
       if not @state.include? :needsRun
@@ -494,7 +513,7 @@ module Rumake
     end
 
     def run_blk
-      @blk.call if @blk
+      @action.call unless @action.nil?
     end
 
     # some tasks may be interrupted, others should finish
@@ -525,79 +544,90 @@ module Rumake
 
   end
 
+  module Tasks
 
-  # The timestamp is stored in the cache.
-  # If that changes or the file does not exist this file must be "rebuild"
-  # rebuilding can be a command, otherwise the timestamp is stored only
-  class FileTask < Task
+    # The timestamp is stored in the cache.
+    # If that changes or the file does not exist this file must be "rebuild"
+    # rebuilding can be a command, otherwise the timestamp is stored only
+    class File < Task
 
-    def initialize(opts, &blk)
-      raise "blk is nil" if blk.nil?
-      raise "key :files expected in opts" unless opts.include? :files
-      opts[:files] = [opts[:files]] if opts[:files].is_a? String
-      opts[:aliases] ||= opts.fetch(:files)
-      @files = opts[:files]
+      def initialize(opts, &blk)
+        raise "no action" if (blk.nil? and not opts.include? :shell_commands)
+        raise "key :files expected in opts" unless opts.include? :files
+        opts[:files] = [opts[:files]] if opts[:files].is_a? String
+        opts[:aliases] = [*opts.fetch(:aliases, [])]
+        opts[:aliases] += [*opts.fetch(:files)]
+        @files = [*opts[:files]] # to array
 
-      @files.each {|v| raise "bad file #{v}" unless v.is_a? String }
-      super(opts, &blk)
-      @stamps = Hash.new
-      @exists = Hash.new
-    end
+        @files.each {|v| raise "bad file #{v.inspect}" unless v.is_a? String }
+        super(opts, &blk)
+        @stamps = Hash.new
+        @exists = Hash.new
+      end
 
-    def determineState
-      return {:needsRun => true } if @files.any? {|file| not File.exists? file }
-      return {:timestamp => @files.each {|file| File.mtime(file) }.max }
-    end
+      def determineState
+        return {:needsRun => true } if @files.any? {|file| not ::File.exists? file }
+        return {:timestamp => @files.each {|file| ::File.mtime(file) }.max }
+      end
 
-    def run_blk
-      # if the build is canceled don't move target files to a .bad location
+      def run_blk
+        # if the build is canceled don't move target files to a .bad location
 
-      begin
-        # @files.each {|v| File.delete(v) if File.exists? v}
-        Task.instance_method(:run_blk).bind(self).call
-        # ensure files exist now
-        @files.each {|f|
-          raise "task failed to create target file #{v}. This usually means there is no rule to build this file." unless File.exists? f
-          File.delete "#{f}.rumakebad" if File.exist? "#{f}.rumakebad"
-        }
+        begin
+          # @files.each {|v| ::File.delete(v) if ::File.exists? v}
+          Task.instance_method(:run_blk).bind(self).call
+          # ensure files exist now
+          @files.each {|f|
+            raise "task failed to create target file #{f}. This usually means there is no rule to build this file." unless ::File.exists? f
+            ::File.delete "#{f}.rumakebad" if ::File.exist? "#{f}.rumakebad"
+          }
 
-      rescue Exception => e
-        @files.each {|f|
-          if File.exist? f
-            puts "#{f} -> #{f}.rumakebad"
-            File.rename f "#{f}.rumakebad"
+        rescue Exception => e
+          @files.each do |f|
+            if ::File.exist? f
+              puts "#{f} -> #{f}.rumakebad"
+              ::File.rename(f, "#{f}.rumakebad")
+            end
           end
-        }
-        raise e
+          raise e
+        end
+      end
+
+    end
+
+    class FileDummy < File
+      def inspect
+        "<#{self.class.name} for #{name}>"
       end
     end
 
-  end
+    # be happy if the directory exists
+    class Dir < Task
 
-  # be happy if the directory exists
-  class DirTask < Task
+      def initialize(opts, &blk)
+        raise "no action" if (blk.nil? and not opts.include? :shell_commands)
+        raise "key :dirs expected in opts" unless opts.include? :dirs
+        opts[:dirs] = [opts[:dirs]] if opts[:dirs].is_a? String
+        opts[:aliases] = [*opts.fetch(:aliases, [])]
+        opts[:aliases] += [*opts.fetch(:dirs)]
+        @dirs = opts[:dirs]
 
-    def initialize(opts, &blk)
-      raise "blk is nil" if blk.nil?
-      raise "key :dirs expected in opts" unless opts.include? :dirs
-      opts[:dirs] = [opts[:dirs]] if opts[:dirs].is_a? String
-      opts[:aliases] ||= opts.fetch(:dirs)
-      @dirs = opts[:dirs]
+        @dirs.each {|v| raise "bad file #{v}" unless v.is_a? String }
+        super(opts, &blk)
+        @exists = Hash.new
+      end
 
-      @dirs.each {|v| raise "bad file #{v}" unless v.is_a? String }
-      super(opts, &blk)
-      @exists = Hash.new
-    end
+      def run_blk
+        @files.each {|v| File.delete(v) if File.exists? v}
+        Task.instance_method(:run_blk).bind(self).call
+        # ensure files exist now
+        @dirs.each {|dir| raise "task failed to create target directory #{dir}" unless ::Dir.exists? v }
+      end
 
-    def run_blk
-      @files.each {|v| File.delete(v) if File.exists? v}
-      Task.instance_method(:run_blk).bind(self).call
-      # ensure files exist now
-      @dirs.each {|dir| raise "task failed to create target directory #{dir}" unless Dir.exists? v }
-    end
+      def determineState
+        return {:needsRun => @dirs.any? {|dir| not ::Dir.exist? dir } }
+      end
 
-    def determineState
-      return {:needsRun => @dirs.any? {|dir| not Dir.exist? dir } }
     end
 
   end
@@ -635,7 +665,7 @@ module Rumake
       o[:prereqs] = opts.values[0]
     end
     o[:own_thread] = true
-    FileTask.new(o, &blk)
+    Tasks::File.new(o, &blk)
   end
 
 
@@ -650,7 +680,7 @@ module Rumake
       o[:prereqs] = opts.values[0]
     end
     o[:own_thread] = true
-    DirTask.new(o, &blk)
+    Tasks::Dir.new(o, &blk)
   end
 
 end

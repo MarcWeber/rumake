@@ -29,17 +29,39 @@ $files << "a"
 
 %w{b c d e f}.each {|v|
   $files << v
-  last_char = file "#{v}" => [(v[0].ord-1).chr] do
-    sh "echo #{v} > #{v}"
-  end
+
+  # because the shell_commands are passed as string these will end up in the
+  # makefile
+  last_char = Rumake::Tasks::File.new({
+    :files => v,
+    :prereqs => [(v[0].ord-1).chr],
+    :shell_commands => "echo #{v} > #{v}"
+  })
 }
 
 task "all" => [last_char] + numbers do
 end
 
 task "clean" do
+  # this will not en dup in the makefile because there is no shell_commands setting
   sh "rm #{$files.to_a.join(' ')}"
 end
+
+
+Rumake::Tasks::File.new({
+  :files => "makefile",
+  :phony => true
+  }) do
+  require_relative "../lib/rumake/makefile.rb"
+
+  errors = []
+  out = []
+  Rumake::TaskContainer.instance.makefile(out, errors)
+  puts "WARNING: errors while creating makefile:"
+  puts errors
+  File.open('makefile', "wb") { |file| file.write(out.join("\n")) }
+end
+
 
 # yes, a DSL is still missing
 Rumake::TaskContainer.instance.init("rumake.cache", 4)

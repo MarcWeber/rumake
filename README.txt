@@ -14,6 +14,7 @@ features:
 
 TODO:
 - rake like DSL
+- provide make file abstraction
 
 
 goals:
