@@ -1,12 +1,13 @@
 # encoding: UTF-8# encoding: UTF-8
 require_relative "../lib/rumake/task.rb"
+require_relative "../lib/rumake/rakelike.rb"
 require "set"
 
 # usage: ruby tests/test.rb all
 # usage: ruby tests/test.rb clean
 # usage: ruby tests/test.rb list # list tasks and weights
 
-include Rumake
+include Rumake::Rakelike
 
 numbers = []
 last_char = nil

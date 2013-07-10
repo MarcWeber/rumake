@@ -9,9 +9,11 @@ module Rumake
 
   module Actions
     class ShellCommands
-      attr_reader :shell_commands
+      attr_reader :shell_commands, :actionId
       def initialize(*shell_commands)
         @shell_commands = shell_commands
+        require 'digest/md5'
+        @actionId = Digest::MD5.hexdigest(@shell_commands.join("\n"))
       end
 
       def call
@@ -405,6 +407,10 @@ module Rumake
       # phony true: always run task
       @phony = opts.fetch(:phony, false)
       @prepared = false
+
+      @actionId = (@action.respond_to? :actionId) ? @action.actionId : nil
+
+      @actionChanged = :dont_know
     end
 
     def name; @aliases[0]; end
@@ -425,6 +431,8 @@ module Rumake
 
       raise "circular dependency deteced" if prepared.include? self
 
+      @actionChanged = @cache.retrieve(:last_action) != @actionId
+
       # replace names by tasks
       @prereqs.map! {|v| @container.resolveTask(v) }
       @prereqs.each {|p|
@@ -439,7 +447,8 @@ module Rumake
       }
 
       @neededPrereqs = @prereqs.select {|v| v.needsRun }
-      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun } || @phony) \
+
+      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun } || @phony || @actionChanged) \
         ? {:needsRun => true} \
         : determineState
       if not @state.include? :needsRun
@@ -470,6 +479,8 @@ module Rumake
     def start(submitResult)
       @started = Time.now
 
+      @cache.store(:last_action, @actionId)
+
       if @own_thread
         # only supporting threads for now
         # my goall is to run compilers, thus having multiple processes doesn't
@@ -485,7 +496,10 @@ module Rumake
       return if @status == :canceled
       return if r[:result] == :failure
 
-      @cache.store(:eta, Time.now - @started)
+      # try with and without action id
+      eta = Time.now - @started
+      @cache.store(:eta, eta)
+      @cache.store("%s %s" % [@actionId.to_s, "eta"], eta)
     end
 
     def notify_dependency_realised(task)
@@ -538,7 +552,8 @@ module Rumake
     end
 
     def eta
-      eta = @cache.retrieve(:eta)
+      eta = @cache.retrieve("%s %s" % [@actionId.to_s, "eta"])
+      eta = @cache.retrieve("eta") unless eta
       eta.nil? ? 0.01 : eta
     end
 
