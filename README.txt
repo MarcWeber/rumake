@@ -12,7 +12,7 @@ features:
   (no processes, thus if you have long running ruby calculations we have to
   think about a solution)
 * estimated time of arrival support by simulating the build based on previous runs
-* taks.respond_to? :shell_commands => export to makefile
+* tasks.respond_to? :shell_commands => export to makefile
 * force rebuild when the command line changes (see @actionChanged)
 
 TODO:
