@@ -87,11 +87,13 @@ module Rumake
       def fromTask(task)
         raise "bad eta #{task.name}" if task.eta.nil?
         now = Time.now
+        # max beacuse a build may be overtime, so prevent negative numbers
+        eta = [0, task.started ? task.eta - (now - task.started) : task.eta].max
         new(task.object_id, task.needsRun, task.neededPrereqs.map {|task|
           raise "bad" unless task.is_a? Task
           task.object_id
         }, task.weight,
-        task.started ? task.eta - (now - task.started) : task.eta,
+        eta,
         task.name)
       end
     end
