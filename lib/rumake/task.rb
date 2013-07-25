@@ -472,6 +472,10 @@ module Rumake
           max = @prereqs.select {|v| not v.timestamp.nil? } .max_by {|p| p.timestamp }
           if max.nil? || @timestamp.nil?
           else
+            # if there is no action there is no chance to rebuild it
+            # inherit timestamp von prerequisites in this case
+            @timestamp = max.timestamp if @timestamp < max.timestamp unless @action
+
             @needsRun = "prerequisite #{max.inspect} is newer" if max.timestamp > @timestamp
           end
         end
@@ -554,7 +558,7 @@ module Rumake
     # must return either :needsRun or :timestamp
     # its only called if no of the @prereqs needs to be run
     def determineNeedsRun
-      @needsRun = "determineNeedsRun not implemented, assuming true"
+      @needsRun = "determineNeedsRun not implemented, assuming true" if @action
     end
 
     def eta
@@ -573,7 +577,6 @@ module Rumake
     class File < Task
 
       def initialize(opts, &blk)
-        raise "no action" if (blk.nil? and not opts.include? :shell_commands)
         raise "key :files expected in opts" unless opts.include? :files
         opts[:files] = [opts[:files]] if opts[:files].is_a? String
         opts[:aliases] = [*opts.fetch(:aliases, [])]

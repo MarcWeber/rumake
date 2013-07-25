@@ -1,4 +1,6 @@
-# encoding: UTF-8# encoding: UTF-8
+# encoding: UTF-8
+#
+# TODO: implement marking PHONY tasks
 
 module Rumake
 
@@ -35,6 +37,8 @@ module Rumake
       if @action.respond_to? :shell_commands
         makefile_lines(lines, @aliases, prereqs, @action.shell_commands)
       elsif @action.nil?
+        # eventually touch target (file/dir case) to prevent rebuilding
+        # for tasks which don't have a builder
         makefile_lines(lines, @aliases, prereqs, [])
       elsif @action.nil?
         # only dependencies, no target
