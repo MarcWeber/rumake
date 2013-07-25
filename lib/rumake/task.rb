@@ -131,7 +131,6 @@ module Rumake
     def runnable(task);
       @waiting_tasks.delete task if @waiting_tasks.include? task
       if not @runnable_tasks.include? task
-        puts "runnable_tasks: adding task #{task.object_id}"
         @runnable_tasks << task
       end
     end
@@ -293,7 +292,7 @@ module Rumake
         when :success
           task.depending_tasks.each do |v|
             v.notify_dependency_realised(task)
-            @bs.runnable(v) if v.neededPrereqs.length == 0 and bs.waiting_tasks.include? task
+            @bs.runnable(v) if v.neededPrereqs.length == 0 and @bs.waiting_tasks.include? v
           end
           @bs.startTasks {|v| @submitResult.enq v }
           puts "%d tasks left, %d running" % [@bs.running_tasks.length + @bs.runnable_tasks.length + @bs.waiting_tasks.length, @bs.running_tasks.length]
@@ -417,14 +416,12 @@ module Rumake
 
       @actionChanged = :dont_know
       @run_when_cmd_changes = opts.fetch(:run_when_cmd_changes, true)
-
-      puts "#{self.object_id} - #{self.inspect}"
     end
 
     def name; @aliases[0]; end
 
     def inspect
-      "<#{self.class.name} #{self.object_id} #{@needsRun ? "needs run" : "up to date"} aliases: #{@aliases.inspect} :depends #{@prereqs.map {|v| (v.respond_to? :name) ? v.name : v}} #{@needsRun ? "needs run because #{@needsRun}" : ""}>"
+      "<#{self.class.name} #{self.object_id} #{@needsRun ? "!" : ""} aliases: #{@aliases.inspect} :depends #{@prereqs.map {|v| (v.respond_to? :name) ? v.name : v}} #{@needsRun ? ", needs run because #{@needsRun}" : ""}>"
     end
 
     def depending_task(task)
@@ -433,12 +430,12 @@ module Rumake
 
     # visit all tasks, determine which must be run
     def prepare(weight, prepared, seen, bs)
-      @timestamp = nil
-      @needsRun = nil
-
       # prevent this task from getting prepared multiple times
       return if seen.include? self
       seen << self
+
+      @timestamp = nil
+      @needsRun = nil
 
       raise "circular dependency deteced" if prepared.include? self
 
@@ -626,6 +623,9 @@ module Rumake
     class FileDummy < File
       def inspect
         "<#{self.class.name} for #{name}>"
+      end
+      def determineNeedsRun
+        @timestamp = ::File.mtime(name) if ::File.exist? name
       end
     end
 
