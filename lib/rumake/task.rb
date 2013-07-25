@@ -78,9 +78,6 @@ module Rumake
       @name = name
     end
 
-    def startTasks(submitResult)
-    end
-
     def start(blk); end
 
     class << self
@@ -129,6 +126,16 @@ module Rumake
       return to_start.length
     end
 
+    def uptodate(task); @uptodate_tasks << task; end
+    def waiting(task); @waiting_tasks << task; end
+    def runnable(task);
+      @waiting_tasks.delete task if @waiting_tasks.include? task
+      if not @runnable_tasks.include? task
+        puts "runnable_tasks: adding task #{task.object_id}"
+        @runnable_tasks << task
+      end
+    end
+
   end
 
   # the controller starting tasks, knowing about which tasks exist etc
@@ -146,13 +153,6 @@ module Rumake
 
       # stored on disk eventually
       @cache = Hash.new
-    end
-
-    def uptodate(task); @bs.uptodate_tasks << task; end
-    def waiting(task); @bs.waiting_tasks << task; end
-    def runnable(task);
-      @bs.waiting_tasks.delete task if @bs.waiting_tasks.include? task
-      @bs.runnable_tasks << task;
     end
 
     def addtask(task)
@@ -202,7 +202,7 @@ module Rumake
       puts "preparing #{targets.inspect}"
       @targets = targets.map {|v| resolveTask(v)}
 
-      @targets.each {|v| v.prepare(0, [], seen) }
+      @targets.each {|v| v.prepare(0, [], seen, @bs) }
       if @bs.runnable_tasks.length == 0
         puts "nothing to do"
         return
@@ -291,7 +291,10 @@ module Rumake
         @bs.running_tasks.delete(task)
         case r[:result]
         when :success
-          task.depending_tasks.each {|v| v.notify_dependency_realised(task) }
+          task.depending_tasks.each do |v|
+            v.notify_dependency_realised(task)
+            @bs.runnable(v) if v.neededPrereqs.length == 0 and bs.waiting_tasks.include? task
+          end
           @bs.startTasks {|v| @submitResult.enq v }
           puts "%d tasks left, %d running" % [@bs.running_tasks.length + @bs.runnable_tasks.length + @bs.waiting_tasks.length, @bs.running_tasks.length]
 
@@ -381,7 +384,7 @@ module Rumake
     # :prereqs: on which other tasks does this task depend. Either names or task objects
     # :aliases This task provides aliases (names, file names, whatever)
 
-    attr_reader :prereqs, :aliases, :needsRun, :timestamp, :weight, :depending_tasks, :neededPrereqs, :started
+    attr_reader :prereqs, :aliases, :weight, :depending_tasks, :neededPrereqs, :started, :timestamp, :needsRun
 
     def initialize(opts, &blk)
       @action = (opts.include? :shell_commands) ? Rumake::Actions::ShellCommands.new(*opts[:shell_commands]) : blk
@@ -413,12 +416,15 @@ module Rumake
       @actionId = (@action.respond_to? :actionId) ? @action.actionId : nil
 
       @actionChanged = :dont_know
+      @run_when_cmd_changes = opts.fetch(:run_when_cmd_changes, true)
+
+      puts "#{self.object_id} - #{self.inspect}"
     end
 
     def name; @aliases[0]; end
 
     def inspect
-      "<#{self.class.name} aliases: #{@aliases.inspect} #{@needsRun ? "needs run" : ""} :depends #{@prereqs.map {|v| v.name}}>"
+      "<#{self.class.name} #{self.object_id} #{@needsRun ? "needs run" : "up to date"} aliases: #{@aliases.inspect} :depends #{@prereqs.map {|v| (v.respond_to? :name) ? v.name : v}} #{@needsRun ? "needs run because #{@needsRun}" : ""}>"
     end
 
     def depending_task(task)
@@ -426,7 +432,10 @@ module Rumake
     end
 
     # visit all tasks, determine which must be run
-    def prepare(weight, prepared, seen)
+    def prepare(weight, prepared, seen, bs)
+      @timestamp = nil
+      @needsRun = nil
+
       # prevent this task from getting prepared multiple times
       return if seen.include? self
       seen << self
@@ -444,38 +453,47 @@ module Rumake
       @weight = weight + eta
 
       @prereqs.each {|v|
-        v.prepare(@weight, prepared + [self], seen)
+        v.prepare(@weight, prepared + [self], seen, bs)
         v.depending_task(self)
       }
 
       @neededPrereqs = @prereqs.select {|v| v.needsRun }
 
-      @state = (@neededPrereqs.count > 0 || @prereqs.any? {|p| p.needsRun } || @phony || @actionChanged) \
-        ? {:needsRun => true} \
-        : determineState
-      if not @state.include? :needsRun
-        p_stamp = @prereqs.map {|p| p.timestamp }.compact.max
-        @state = {:needsRun => p_stamp.nil? ? false : p_stamp > @state[:timestamp]}
+      if @phony
+        @needsRun = "phony true"
+      elsif @neededPrereqs.count > 0
+        @needsRun = "@neededPrereqs.count > 0"
+      elsif firstNeeded = @prereqs.detect {|p| p.needsRun } 
+        @needsRun = "one dep needs run: #{firstNeeded.inspect}"
+      elsif (@actionChanged && @run_when_cmd_changes)
+        @needsRun = "action changed && @run_when_cmd_changes"
+      else
+        # should either call needsRun or set @timestamp
+        determineNeedsRun
+        if @needsRun.nil?
+          # by timestamp
+          max = @prereqs.select {|v| not v.timestamp.nil? } .max_by {|p| p.timestamp }
+          if max.nil? || @timestamp.nil?
+          else
+            @needsRun = "prerequisite #{max.inspect} is newer" if max.timestamp > @timestamp
+          end
+        end
       end
 
-      if needsRun
+      if @needsRun
         if @neededPrereqs.count == 0
-          @container.runnable(self) 
+          bs.runnable(self) 
         else
-          @container.waiting(self) 
+          bs.waiting(self) 
         end
       else
-        @container.uptodate(self)
+        bs.uptodate(self)
       end
 
       @status = :prepared
       @thread = nil
       @started = nil
       @prepared = true
-    end
-
-    def needsRun
-      @state[:needsRun]
     end
 
     def start(submitResult)
@@ -506,9 +524,6 @@ module Rumake
 
     def notify_dependency_realised(task)
       @neededPrereqs.delete(task)
-      if @neededPrereqs.count == 0
-        @container.runnable(self) 
-      end
     end
 
     def run_submit_result(submitResult)
@@ -539,18 +554,10 @@ module Rumake
       @thread.raise "STOP IT" if @thread
     end
 
-    def timestamp
-      @state[:timestamp]
-    end
-
-    def needsRun
-      @state[:needsRun]
-    end
-
     # must return either :needsRun or :timestamp
     # its only called if no of the @prereqs needs to be run
-    def determineState
-      return {:needsRun => @phony}
+    def determineNeedsRun
+      @needsRun = "determineNeedsRun not implemented, assuming true"
     end
 
     def eta
@@ -582,9 +589,13 @@ module Rumake
         @exists = Hash.new
       end
 
-      def determineState
-        return {:needsRun => true } if @files.any? {|file| not ::File.exists? file }
-        return {:timestamp => @files.each {|file| ::File.mtime(file) }.max }
+      def determineNeedsRun
+        firstMissing = @files.detect {|file| not ::File.exists? file }
+        if firstMissing
+          @needsRun = "target file  #{firstMissing} does not exist"
+        else
+          @timestamp = @files.map {|file| ::File.mtime(file) }.max
+        end
       end
 
       def run_blk
@@ -627,6 +638,9 @@ module Rumake
         opts[:dirs] = [opts[:dirs]] if opts[:dirs].is_a? String
         opts[:aliases] = [*opts.fetch(:aliases, [])]
         opts[:aliases] += [*opts.fetch(:dirs)]
+
+        # directories are likely to be vcs checkouts, don't rerun
+        opts[:run_when_cmd_changes] = false
         @dirs = opts[:dirs]
 
         @dirs.each {|v| raise "bad file #{v}" unless v.is_a? String }
@@ -635,14 +649,15 @@ module Rumake
       end
 
       def run_blk
-        @files.each {|v| File.delete(v) if File.exists? v}
+        # @dirs.each {|v| File.delete(v) if File.exists? v}
         Task.instance_method(:run_blk).bind(self).call
         # ensure files exist now
         @dirs.each {|dir| raise "task failed to create target directory #{dir}" unless ::Dir.exists? v }
       end
 
-      def determineState
-        return {:needsRun => @dirs.any? {|dir| not ::Dir.exist? dir } }
+      def determineNeedsRun
+        firstMissing = @dirs.detect {|dir| not ::Dir.exists? dir }
+        @needsRun = "target dir #{firstMissing} does not exist" if firstMissing
       end
 
     end
